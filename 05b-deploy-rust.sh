@@ -45,6 +45,18 @@ read -rp "Port d'écoute local (ex: 3001) : " APP_PORT
 read -rp "DATABASE_URL (laisse vide pour ignorer) : " DB_URL
 
 echo ""
+echo "Dossiers à PRÉSERVER entre les releases (uploads, fichiers utilisateurs, etc.)"
+echo "Stockés dans /opt/$APP_NAME/shared/<dossier>/ et symlinkés à chaque deploy."
+echo "Format : un par ligne (chemin relatif à current/), ligne vide pour terminer"
+echo "Exemples : uploads, data, attachments"
+PERSISTENT_DIRS=()
+while true; do
+  read -rp "  > " LINE
+  [ -z "$LINE" ] && break
+  PERSISTENT_DIRS+=("$LINE")
+done
+
+echo ""
 echo "Variables d'env supplémentaires (format: CLE=VALEUR, ligne vide pour finir)"
 ENV_EXTRAS=()
 while true; do
@@ -86,6 +98,21 @@ mkdir -p "$RELEASES_DIR" "$APP_DIR/shared" "$APP_DIR/logs" "$APP_DIR/tmp"
 chown -R "$APP_NAME":"$APP_NAME" "$APP_DIR"
 chmod 750 "$APP_DIR"
 ok "Structure prête"
+
+# ─── 2b. Dossiers persistants ─────────────────────────────
+if [ ${#PERSISTENT_DIRS[@]} -gt 0 ]; then
+  inf "Création des dossiers persistants..."
+  for D in "${PERSISTENT_DIRS[@]}"; do
+    PERSIST_PATH="$APP_DIR/shared/$D"
+    if [ ! -d "$PERSIST_PATH" ]; then
+      mkdir -p "$PERSIST_PATH"
+      chown -R "$APP_NAME":"$APP_NAME" "$PERSIST_PATH"
+      ok "  shared/$D créé"
+    else
+      ok "  shared/$D existe (préservé)"
+    fi
+  done
+fi
 
 # ─── 3. Fichier .env ──────────────────────────────────────
 {
@@ -160,15 +187,15 @@ EOF
 mkdir -p /opt/shared/scripts
 DEPLOY_SCRIPT="/opt/shared/scripts/deploy-$APP_NAME.sh"
 
+PERSIST_DIRS_STR="$(printf '%s\n' "${PERSISTENT_DIRS[@]:-}")"
+
 cat > "$DEPLOY_SCRIPT" << DEPLOYEOF
 #!/bin/bash
 # Déployer une nouvelle version de $APP_NAME (Rust)
 # Usage :
-#   sudo bash $DEPLOY_SCRIPT <chemin_binaire>
-#     → déploie juste le binaire
-#   sudo bash $DEPLOY_SCRIPT <dossier> --with-assets
-#     → déploie un dossier contenant le binaire + assets (migrations/, static/, etc.)
-set -euo pipefail
+#   sudo bash $DEPLOY_SCRIPT <chemin_binaire>            # binaire seul
+#   sudo bash $DEPLOY_SCRIPT <dossier> --with-assets     # binaire + assets
+set -uo pipefail
 
 SRC=\${1:-""}
 MODE=\${2:-"binary"}
@@ -177,36 +204,66 @@ MODE=\${2:-"binary"}
 APP_NAME="$APP_NAME"
 APP_DIR="$APP_DIR"
 BINARY_NAME="$BINARY_NAME"
+PERSISTENT_DIRS_RAW="$PERSIST_DIRS_STR"
 RELEASES_DIR="\$APP_DIR/releases"
 CURRENT_LINK="\$APP_DIR/current"
 
+PREV_RELEASE=""
+[ -L "\$CURRENT_LINK" ] && PREV_RELEASE=\$(readlink -f "\$CURRENT_LINK")
+
 TS=\$(date +%Y%m%d_%H%M%S)
 NEW_RELEASE="\$RELEASES_DIR/\$TS"
+
+abort() {
+  echo "✗ \$1"
+  echo "  Release ratée conservée : \$NEW_RELEASE"
+  exit 1
+}
 
 echo "→ Création de \$NEW_RELEASE"
 mkdir -p "\$NEW_RELEASE"
 
 if [ "\$MODE" = "--with-assets" ]; then
-  [ ! -d "\$SRC" ] && { echo "Dossier introuvable: \$SRC"; exit 1; }
+  [ ! -d "\$SRC" ] && abort "Dossier introuvable: \$SRC"
   cp -a "\$SRC"/. "\$NEW_RELEASE"/
-  [ ! -f "\$NEW_RELEASE/\$BINARY_NAME" ] && { echo "Binaire \$BINARY_NAME absent de \$SRC"; exit 1; }
+  [ ! -f "\$NEW_RELEASE/\$BINARY_NAME" ] && abort "Binaire \$BINARY_NAME absent de \$SRC"
 else
-  [ ! -f "\$SRC" ] && { echo "Binaire introuvable: \$SRC"; exit 1; }
+  [ ! -f "\$SRC" ] && abort "Binaire introuvable: \$SRC"
   cp "\$SRC" "\$NEW_RELEASE/\$BINARY_NAME"
 fi
 
 chown -R \$APP_NAME:\$APP_NAME "\$NEW_RELEASE"
 chmod 750 "\$NEW_RELEASE/\$BINARY_NAME"
 
+# Symlinks dossiers persistants (uploads, etc.)
+if [ -n "\$PERSISTENT_DIRS_RAW" ]; then
+  echo "→ Symlinks dossiers persistants depuis shared/..."
+  while IFS= read -r D; do
+    [ -z "\$D" ] && continue
+    SHARED_PATH="\$APP_DIR/shared/\$D"
+    REL_PATH="\$NEW_RELEASE/\$D"
+    if [ ! -d "\$SHARED_PATH" ]; then
+      mkdir -p "\$SHARED_PATH"
+      chown -R \$APP_NAME:\$APP_NAME "\$SHARED_PATH"
+    fi
+    if [ -d "\$REL_PATH" ] && [ ! -L "\$REL_PATH" ]; then
+      if [ -z "\$(ls -A "\$SHARED_PATH" 2>/dev/null)" ]; then
+        cp -a "\$REL_PATH"/. "\$SHARED_PATH"/ 2>/dev/null || true
+        chown -R \$APP_NAME:\$APP_NAME "\$SHARED_PATH"
+      fi
+      rm -rf "\$REL_PATH"
+    fi
+    mkdir -p "\$(dirname "\$REL_PATH")"
+    ln -sfn "\$SHARED_PATH" "\$REL_PATH"
+    echo "    \$D → shared/\$D"
+  done <<< "\$PERSISTENT_DIRS_RAW"
+fi
+
 MIGRATION_CMD="$MIGRATION_CMD"
 if [ -n "\$MIGRATION_CMD" ]; then
-  echo "→ Exécution des migrations DB : \$MIGRATION_CMD"
-  if ! su -s /bin/bash \$APP_NAME -c "cd \$NEW_RELEASE && set -a && . \$APP_DIR/shared/.env && set +a && \$MIGRATION_CMD"; then
-    echo ""
-    echo "✗ Migration échouée — swap annulé"
-    echo "  Release ratée conservée pour debug : \$NEW_RELEASE"
-    exit 1
-  fi
+  echo "→ Migrations DB : \$MIGRATION_CMD"
+  su -s /bin/bash \$APP_NAME -c "cd \$NEW_RELEASE && set -a && . \$APP_DIR/shared/.env && set +a && \$MIGRATION_CMD" \\
+    || abort "Migration échouée"
 fi
 
 echo "→ Bascule du symlink current"
@@ -216,8 +273,34 @@ chown -h \$APP_NAME:\$APP_NAME "\$CURRENT_LINK"
 
 echo "→ Démarrage de \$APP_NAME..."
 systemctl start \$APP_NAME
-sleep 2
-systemctl status \$APP_NAME --no-pager -l | head -15
+
+# Health check + rollback automatique
+echo "→ Health check (10s)..."
+sleep 5
+HEALTHY=true
+for i in 1 2 3; do
+  if ! systemctl is-active --quiet "\$APP_NAME"; then
+    HEALTHY=false
+    break
+  fi
+  sleep 2
+done
+
+if ! \$HEALTHY; then
+  echo ""
+  echo "✗ Service inactif après restart — ROLLBACK automatique"
+  if [ -n "\$PREV_RELEASE" ] && [ -d "\$PREV_RELEASE" ]; then
+    ln -sfn "\$PREV_RELEASE" "\$CURRENT_LINK"
+    chown -h \$APP_NAME:\$APP_NAME "\$CURRENT_LINK"
+    systemctl restart "\$APP_NAME"
+    echo "  → Rollback vers \$(basename "\$PREV_RELEASE")"
+  fi
+  echo ""
+  journalctl -u "\$APP_NAME" -n 30 --no-pager
+  exit 1
+fi
+
+systemctl status \$APP_NAME --no-pager -l | head -10
 
 echo "→ Purge des vieilles releases (garde 5)..."
 cd "\$RELEASES_DIR"

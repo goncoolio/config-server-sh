@@ -52,6 +52,18 @@ read -rp "APP_URL (ex: https://monsite.com) : " APP_URL
 read -rp "DATABASE_URL OU DB_CONNECTION + DB_HOST... (laisse vide pour configurer plus tard) : " DB_URL
 
 echo ""
+echo "Dossiers à PRÉSERVER en plus de storage/ et bootstrap/cache/ (déjà gérés)"
+echo "Stockés dans /opt/$APP_NAME/shared/<dossier>/ et symlinkés à chaque deploy."
+echo "Format : un par ligne, ligne vide pour terminer"
+echo "Exemples : public/uploads, public/storage, public/files, .env.backup"
+PERSISTENT_DIRS=()
+while true; do
+  read -rp "  > " LINE
+  [ -z "$LINE" ] && break
+  PERSISTENT_DIRS+=("$LINE")
+done
+
+echo ""
 echo "Variables d'env supplémentaires (format: CLE=VALEUR, ligne vide pour finir)"
 ENV_EXTRAS=()
 while true; do
@@ -87,6 +99,22 @@ chown -R "$APP_NAME":www-data "$APP_DIR"
 chmod 750 "$APP_DIR"
 chmod -R 775 "$SHARED_DIR/storage" "$SHARED_DIR/bootstrap"
 ok "Structure prête (releases/ shared/storage shared/bootstrap/cache)"
+
+# ─── 2b. Dossiers persistants additionnels (uploads, etc.) ─
+if [ ${#PERSISTENT_DIRS[@]} -gt 0 ]; then
+  inf "Création des dossiers persistants additionnels..."
+  for D in "${PERSISTENT_DIRS[@]}"; do
+    PERSIST_PATH="$SHARED_DIR/$D"
+    if [ ! -d "$PERSIST_PATH" ]; then
+      mkdir -p "$PERSIST_PATH"
+      chown -R "$APP_NAME":www-data "$PERSIST_PATH"
+      chmod -R 775 "$PERSIST_PATH"
+      ok "  shared/$D créé"
+    else
+      ok "  shared/$D existe (préservé)"
+    fi
+  done
+fi
 
 # ─── 3. Fichier .env ──────────────────────────────────────
 inf "Génération de $ENV_FILE..."
@@ -145,6 +173,34 @@ rm -rf "\$NEW_RELEASE/storage" "\$NEW_RELEASE/bootstrap/cache"
 ln -sfn "\$SHARED_DIR/storage" "\$NEW_RELEASE/storage"
 ln -sfn "\$SHARED_DIR/bootstrap/cache" "\$NEW_RELEASE/bootstrap/cache"
 ln -sfn "\$SHARED_DIR/.env" "\$NEW_RELEASE/.env"
+
+# Dossiers persistants additionnels (uploads utilisateurs, etc.)
+PERSISTENT_DIRS_RAW="$(printf '%s\n' "${PERSISTENT_DIRS[@]:-}")"
+if [ -n "\$PERSISTENT_DIRS_RAW" ]; then
+  echo "→ Symlinks dossiers persistants additionnels..."
+  while IFS= read -r D; do
+    [ -z "\$D" ] && continue
+    SHARED_PATH="\$SHARED_DIR/\$D"
+    REL_PATH="\$NEW_RELEASE/\$D"
+    if [ ! -d "\$SHARED_PATH" ]; then
+      mkdir -p "\$SHARED_PATH"
+      chown -R \$APP_NAME:www-data "\$SHARED_PATH"
+      chmod -R 775 "\$SHARED_PATH"
+    fi
+    # Migrer le contenu de la première release dans shared/ si shared est vide
+    if [ -d "\$REL_PATH" ] && [ ! -L "\$REL_PATH" ]; then
+      if [ -z "\$(ls -A "\$SHARED_PATH" 2>/dev/null)" ]; then
+        echo "    → Migration initiale : \$REL_PATH → shared/"
+        cp -a "\$REL_PATH"/. "\$SHARED_PATH"/ 2>/dev/null || true
+        chown -R \$APP_NAME:www-data "\$SHARED_PATH"
+      fi
+      rm -rf "\$REL_PATH"
+    fi
+    mkdir -p "\$(dirname "\$REL_PATH")"
+    ln -sfn "\$SHARED_PATH" "\$REL_PATH"
+    echo "    \$D → shared/\$D"
+  done <<< "\$PERSISTENT_DIRS_RAW"
+fi
 
 chown -R \$APP_NAME:www-data "\$NEW_RELEASE"
 
