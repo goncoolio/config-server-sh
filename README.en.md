@@ -47,9 +47,28 @@ server without unnecessary complexity.
 ```bash
 sudo bash 01-initial-setup.sh        # admin user, SSH, UFW, fail2ban, swap
 sudo bash 02-install-caddy.sh        # Caddy + PHP-FPM (sites-enabled/ structure)
-sudo bash 03-install-postgresql.sh   # PostgreSQL 16
+sudo bash 03-install-database.sh     # menu: PG, MySQL, MariaDB, Mongo, Redis, Supabase
 sudo bash 06-adminer-hardening.sh    # Adminer on local port + Caddy protection
 ```
+
+### Script 03: database menu
+
+Multiple databases can **coexist on the same server**. For each: version
+choice, generated root password, bind 127.0.0.1, initial application
+databases, daily backups (rotation 7d + 4w), optional web UI.
+
+| # | Database | Versions | Associated web UI |
+|---|----------|----------|-------------------|
+| 1 | PostgreSQL | 13, 14, 15, 16, 17 | Adminer |
+| 2 | MySQL (Oracle) | 8.0, 8.4 LTS | Adminer + phpMyAdmin |
+| 3 | MariaDB | 10.6, 10.11, 11.4 LTS | Adminer + phpMyAdmin |
+| 4 | MongoDB | 6.0, 7.0, 8.0 | Mongo Express |
+| 5 | Redis | 6, 7 | RedisInsight |
+| 6 | Supabase (BaaS) | latest stable (Docker) | Studio (built-in) |
+
+All web UIs are exposed via Caddy with basic auth (the script asks for a
+domain and a username at the end of each install). All credentials are saved
+in `/root/db-credentials/<database>-<date>.txt` (chmod 600).
 
 ## View server state
 

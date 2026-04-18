@@ -43,11 +43,30 @@ serveur sans complexité inutile.
 ## Ordre d'exécution (première installation)
 
 ```bash
-sudo bash 01-initial-setup.sh        # utilisateur admin, SSH, UFW, fail2ban
+sudo bash 01-initial-setup.sh        # utilisateur admin, SSH, UFW, fail2ban, swap
 sudo bash 02-install-caddy.sh        # Caddy + PHP-FPM (structure sites-enabled/)
-sudo bash 03-install-postgresql.sh   # PostgreSQL 16
+sudo bash 03-install-database.sh     # menu : PG, MySQL, MariaDB, Mongo, Redis, Supabase
 sudo bash 06-adminer-hardening.sh    # Adminer sur port local + protection Caddy
 ```
+
+### Script 03 : menu de bases de données
+
+Plusieurs bases peuvent **coexister sur le même serveur**. Pour chacune :
+choix de version, mot de passe root généré, bind 127.0.0.1, premières bases
+applicatives, backups quotidiens (rotation 7j + 4 semaines), UI web optionnelle.
+
+| # | Base | Versions | UI web associée |
+|---|------|----------|-----------------|
+| 1 | PostgreSQL | 13, 14, 15, 16, 17 | Adminer |
+| 2 | MySQL (Oracle) | 8.0, 8.4 LTS | Adminer + phpMyAdmin |
+| 3 | MariaDB | 10.6, 10.11, 11.4 LTS | Adminer + phpMyAdmin |
+| 4 | MongoDB | 6.0, 7.0, 8.0 | Mongo Express |
+| 5 | Redis | 6, 7 | RedisInsight |
+| 6 | Supabase (BaaS) | dernier stable (Docker) | Studio (intégré) |
+
+Toutes les UIs web sont exposées via Caddy avec basic auth (le script demande
+un domaine et un identifiant à la fin de chaque install). Tous les credentials
+sont sauvegardés dans `/root/db-credentials/<base>-<date>.txt` (chmod 600).
 
 ## Voir l'état du serveur
 
