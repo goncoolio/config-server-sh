@@ -30,15 +30,15 @@ echo ""
 
 # ─── Framework ────────────────────────────────────────────
 echo "Framework :"
-echo "  1) NestJS   — entry: dist/main.js"
-echo "  2) Express  — entry personnalisable (ex: src/server.js, api.js)"
-echo "  3) Next.js  — entry: node_modules/next/dist/bin/next (start)"
+echo "  1) NestJS   — entry typique: dist/main.js OU dist/src/main.js"
+echo "  2) Express  — entry personnalisable (src/server.js, app.js, index.js, ...)"
+echo "  3) Next.js  — démarrage via 'next start' (auto-détecté)"
 read -rp "Choix [1-3] : " FW_CHOICE
 
 case "$FW_CHOICE" in
   1) FRAMEWORK="nestjs";  DEFAULT_ENTRY="dist/main.js" ;;
   2) FRAMEWORK="express"; DEFAULT_ENTRY="src/server.js" ;;
-  3) FRAMEWORK="nextjs";  DEFAULT_ENTRY="node_modules/next/dist/bin/next" ;;
+  3) FRAMEWORK="nextjs";  DEFAULT_ENTRY="" ;;  # Next.js : géré via next start
   *) err "Choix invalide" ;;
 esac
 
@@ -57,18 +57,25 @@ fi
 read -rp "Port d'écoute local (ex: 3002) : " APP_PORT
 [ -z "$APP_PORT" ] && err "Port obligatoire"
 
-if [ "$FRAMEWORK" = "express" ]; then
-  read -rp "Entry point (relatif à current/, défaut: $DEFAULT_ENTRY) : " ENTRY
-  ENTRY="${ENTRY:-$DEFAULT_ENTRY}"
+if [ "$FRAMEWORK" = "nextjs" ]; then
+  ENTRY=""  # next start gère tout
 else
-  ENTRY="$DEFAULT_ENTRY"
+  echo ""
+  echo "Entry point (chemin relatif à current/) — vérifié après le build."
+  case "$FRAMEWORK" in
+    nestjs)
+      echo "  Possibilités courantes : dist/main.js, dist/src/main.js"
+      echo "  (selon ta structure tsconfig — auto-détection de fallback à l'exécution)"
+      ;;
+    express)
+      echo "  Possibilités courantes : src/server.js, src/app.js, src/index.js, app.js, index.js"
+      ;;
+  esac
+  read -rp "Entry point [$DEFAULT_ENTRY] : " ENTRY
+  ENTRY="${ENTRY:-$DEFAULT_ENTRY}"
 fi
 
 read -rp "DATABASE_URL (laisse vide pour ignorer) : " DB_URL
-read -rp "Node managera via 'npm start' ? (oui/non, défaut: non pour NestJS/Express, oui pour Next.js) : " USE_NPM_START
-if [ -z "$USE_NPM_START" ]; then
-  [ "$FRAMEWORK" = "nextjs" ] && USE_NPM_START="oui" || USE_NPM_START="non"
-fi
 
 echo ""
 echo "Commande de build à exécuter sur le serveur après npm ci (laisse vide si aucune)"
@@ -79,6 +86,24 @@ case "$FRAMEWORK" in
 esac
 read -rp "Commande [$DEFAULT_BUILD] : " BUILD_CMD
 BUILD_CMD="${BUILD_CMD:-$DEFAULT_BUILD}"
+
+echo ""
+echo "Dossiers à PRÉSERVER entre les releases (uploads, fichiers utilisateurs, etc.)"
+echo "Ils seront stockés dans /opt/$APP_NAME/shared/<dossier>/ et symlinkés à chaque deploy."
+echo "Format : un par ligne (chemin relatif à current/), ligne vide pour terminer"
+echo "Exemples : uploads, public/uploads, public/storage, files, attachments"
+PERSISTENT_DIRS=()
+while true; do
+  read -rp "  > " LINE
+  [ -z "$LINE" ] && break
+  PERSISTENT_DIRS+=("$LINE")
+done
+
+echo ""
+echo "DevDependencies à GARDER en production (séparés par des espaces, vide pour aucun)"
+echo "Utile si une commande de seed/migration en prod nécessite des outils dev."
+echo "Exemple Prisma+ts-node : ts-node typescript @types/node"
+read -rp "Packages : " KEEP_DEV_DEPS
 
 echo ""
 echo "Variables d'env supplémentaires (optionnel)"
@@ -135,16 +160,7 @@ else
   ok "Node.js déjà installé : $(node -v)"
 fi
 
-# ─── 2. PM2 ───────────────────────────────────────────────
-if ! command -v pm2 &>/dev/null; then
-  inf "Installation de PM2..."
-  npm install -g pm2
-  ok "PM2 $(pm2 -v)"
-else
-  ok "PM2 déjà installé"
-fi
-
-# ─── 3. Utilisateur système ───────────────────────────────
+# ─── 2. Utilisateur système ───────────────────────────────
 if ! id "$APP_NAME" &>/dev/null; then
   useradd -m -s /bin/bash -d "$APP_DIR" -c "Service $APP_NAME" "$APP_NAME"
   ok "Utilisateur $APP_NAME créé"
@@ -152,12 +168,27 @@ else
   ok "Utilisateur $APP_NAME existe"
 fi
 
-# ─── 4. Structure de répertoires (releases-based) ─────────
+# ─── 3. Structure de répertoires (releases-based) ─────────
 inf "Préparation de $APP_DIR..."
 mkdir -p "$RELEASES_DIR" "$APP_DIR/shared" "$APP_DIR/logs"
 chown -R "$APP_NAME":"$APP_NAME" "$APP_DIR"
 chmod 750 "$APP_DIR"
 ok "Structure prête : releases/, shared/, logs/, current→"
+
+# ─── 3b. Dossiers persistants (uploads, etc.) ─────────────
+if [ ${#PERSISTENT_DIRS[@]} -gt 0 ]; then
+  inf "Création des dossiers persistants dans shared/..."
+  for D in "${PERSISTENT_DIRS[@]}"; do
+    PERSIST_PATH="$APP_DIR/shared/$D"
+    if [ ! -d "$PERSIST_PATH" ]; then
+      mkdir -p "$PERSIST_PATH"
+      chown -R "$APP_NAME":"$APP_NAME" "$PERSIST_PATH"
+      ok "  shared/$D créé"
+    else
+      ok "  shared/$D existe (préservé)"
+    fi
+  done
+fi
 
 # ─── 5. Fichier .env (shared, persiste entre releases) ────
 inf "Génération de $ENV_FILE..."
@@ -175,80 +206,46 @@ chown root:"$APP_NAME" "$ENV_FILE"
 chmod 640 "$ENV_FILE"
 ok ".env créé (chmod 640)"
 
-# ─── 6. ecosystem.config.js (dans shared/, référence current/) ─
-PM2_CONFIG="$APP_DIR/shared/ecosystem.config.js"
+# ─── 6. Service systemd direct (sans PM2) ─────────────────
+# systemd est l'unique superviseur — PM2 supprimé pour éviter
+# la double gestion (cf. diagnostic api-wii-saas).
+inf "Configuration de systemd (Type=simple, node direct)..."
 
-# Construire la section script/args selon le framework
-if [ "$USE_NPM_START" = "oui" ]; then
-  SCRIPT_LINE="script: 'npm',"
-  ARGS_LINE="args: 'start',"
-elif [ "$FRAMEWORK" = "nextjs" ]; then
-  SCRIPT_LINE="script: './$ENTRY',"
-  ARGS_LINE="args: 'start -p $APP_PORT',"
-else
-  SCRIPT_LINE="script: './$ENTRY',"
-  ARGS_LINE=""
-fi
+# Construire ExecStart selon le framework
+case "$FRAMEWORK" in
+  nextjs)
+    # Next.js : on utilise le bin de next dans node_modules/
+    EXEC_START="/usr/bin/node $CURRENT_LINK/node_modules/next/dist/bin/next start -p $APP_PORT"
+    ;;
+  *)
+    # NestJS / Express : node directement sur l'entry point
+    EXEC_START="/usr/bin/node $CURRENT_LINK/$ENTRY"
+    ;;
+esac
 
-cat > "$PM2_CONFIG" << EOF
-// Config PM2 pour $APP_NAME ($FRAMEWORK) — HTIC-NETWORKS
-module.exports = {
-  apps: [{
-    name: '$APP_NAME',
-    cwd: '$CURRENT_LINK',
-    $SCRIPT_LINE
-    $ARGS_LINE
-
-    instances: 1,
-    exec_mode: 'fork',
-
-    env_file: '$ENV_FILE',
-    env: {
-      NODE_ENV: 'production',
-      PORT: $APP_PORT,
-    },
-
-    watch: false,
-    autorestart: true,
-    max_restarts: 10,
-    restart_delay: 5000,
-    min_uptime: '10s',
-
-    out_file: '$APP_DIR/logs/out.log',
-    error_file: '$APP_DIR/logs/err.log',
-    log_date_format: 'YYYY-MM-DD HH:mm:ss',
-    merge_logs: true,
-
-    max_memory_restart: '512M',
-    kill_timeout: 5000,
-    listen_timeout: 3000,
-  }]
-}
-EOF
-chown "$APP_NAME":"$APP_NAME" "$PM2_CONFIG"
-ok "Config PM2 générée"
-
-# ─── 7. Service systemd ───────────────────────────────────
-inf "Configuration de systemd..."
 cat > "/etc/systemd/system/$APP_NAME.service" << EOF
 [Unit]
-Description=$APP_NAME — $FRAMEWORK via PM2
+Description=$APP_NAME — $FRAMEWORK (node direct)
 After=network-online.target postgresql.service
 Wants=network-online.target
 
 [Service]
-Type=forking
+Type=simple
 User=$APP_NAME
 Group=$APP_NAME
-WorkingDirectory=$APP_DIR
+WorkingDirectory=$CURRENT_LINK
 
-Environment=PM2_HOME=$APP_DIR/.pm2
-ExecStart=$(which pm2) start $PM2_CONFIG --env production
-ExecReload=$(which pm2) reload $APP_NAME
-ExecStop=$(which pm2) stop $APP_NAME
+Environment=HOME=$APP_DIR
+Environment=NODE_ENV=production
+Environment=PORT=$APP_PORT
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
+EnvironmentFile=$ENV_FILE
 
-Restart=on-failure
+ExecStart=$EXEC_START
+
+Restart=always
 RestartSec=10s
+LimitNOFILE=65536
 
 StandardOutput=append:$APP_DIR/logs/systemd.log
 StandardError=append:$APP_DIR/logs/systemd-err.log
@@ -259,9 +256,9 @@ EOF
 
 systemctl daemon-reload
 systemctl enable "$APP_NAME"
-ok "Service systemd $APP_NAME activé"
+ok "Service systemd $APP_NAME activé (Type=simple, node direct)"
 
-# ─── 8. Logrotate ─────────────────────────────────────────
+# ─── 7. Logrotate ─────────────────────────────────────────
 cat > "/etc/logrotate.d/$APP_NAME" << EOF
 $APP_DIR/logs/*.log {
     daily
@@ -270,9 +267,7 @@ $APP_DIR/logs/*.log {
     missingok
     notifempty
     create 640 $APP_NAME $APP_NAME
-    postrotate
-        su -s /bin/bash $APP_NAME -c "pm2 reloadLogs" 2>/dev/null || true
-    endscript
+    copytruncate
 }
 EOF
 
@@ -280,24 +275,30 @@ EOF
 mkdir -p /opt/shared/scripts
 DEPLOY_SCRIPT="/opt/shared/scripts/deploy-$APP_NAME.sh"
 
+# Encoder la liste des dossiers persistants pour l'embarquer dans le script généré
+PERSIST_DIRS_STR="$(printf '%s\n' "${PERSISTENT_DIRS[@]:-}")"
+
 cat > "$DEPLOY_SCRIPT" << DEPLOYEOF
 #!/bin/bash
 # Déployer une nouvelle version de $APP_NAME ($FRAMEWORK)
 # Usage : sudo bash $DEPLOY_SCRIPT <source_dir>
 #
-# <source_dir> doit contenir le CODE SOURCE complet (envoyé sans
-# dist/, .next/, node_modules/, .git/) — tout est construit sur le serveur.
+# <source_dir> = code source complet (sans dist/, .next/, node_modules/, .git/)
+# Tout est construit sur le serveur.
 #
 # Pipeline :
 #   1. Copie source dans releases/<timestamp>/
-#   2. npm ci  (toutes les deps, devDependencies incluses)
-#   3. npm run build (si framework nécessite)
-#   4. Migrations DB (si configurées)
-#   5. npm prune --omit=dev  (supprime les devDependencies)
-#   6. Bascule atomique du symlink current
-#   7. Reload PM2 (zero-downtime)
-#   8. Purge les vieilles releases (garde 5)
-set -euo pipefail
+#   2. Symlink des dossiers persistants (uploads, etc.) depuis shared/
+#   3. npm ci --include=dev (toutes les deps pour permettre le build)
+#   4. Build (si framework nécessite)
+#   5. Migrations DB (si configurées)
+#   6. npm prune --omit=dev (retire devDependencies)
+#   7. Réinstalle les devDeps marquées "à garder en prod" (ts-node, etc.)
+#   8. Vérification que l'entry point existe (auto-fallback NestJS)
+#   9. Bascule atomique du symlink current
+#  10. Restart systemd + health check (rollback auto si KO)
+#  11. Purge les vieilles releases (garde 5)
+set -uo pipefail
 
 SRC=\${1:-""}
 [ -z "\$SRC" ] && { echo "Usage: \$0 <source_dir>"; exit 1; }
@@ -307,96 +308,189 @@ SRC=\${1:-""}
 APP_NAME="$APP_NAME"
 APP_DIR="$APP_DIR"
 FRAMEWORK="$FRAMEWORK"
+ENTRY="$ENTRY"
 BUILD_CMD="$BUILD_CMD"
 MIGRATION_CMD="$MIGRATION_CMD"
+KEEP_DEV_DEPS="$KEEP_DEV_DEPS"
 RELEASES_DIR="\$APP_DIR/releases"
 CURRENT_LINK="\$APP_DIR/current"
+
+# Liste des dossiers persistants (un par ligne)
+PERSISTENT_DIRS_RAW="$PERSIST_DIRS_STR"
+
+# Capturer la release courante AVANT le swap, pour rollback en cas d'échec
+PREV_RELEASE=""
+[ -L "\$CURRENT_LINK" ] && PREV_RELEASE=\$(readlink -f "\$CURRENT_LINK")
 
 TS=\$(date +%Y%m%d_%H%M%S)
 NEW_RELEASE="\$RELEASES_DIR/\$TS"
 
+abort() {
+  echo "✗ \$1"
+  echo "  Release ratée conservée pour debug : \$NEW_RELEASE"
+  exit 1
+}
+
 echo "→ Création de \$NEW_RELEASE"
-mkdir -p "\$NEW_RELEASE"
-cp -a "\$SRC"/. "\$NEW_RELEASE"/
-# Sécurité : purger les artefacts de build envoyés par erreur
+mkdir -p "\$NEW_RELEASE" || abort "mkdir échoué"
+cp -a "\$SRC"/. "\$NEW_RELEASE"/ || abort "Copie source échouée"
+# Sécurité : purger les artefacts envoyés par erreur (jamais utiliser ceux du dev)
 rm -rf "\$NEW_RELEASE/node_modules" "\$NEW_RELEASE/dist" "\$NEW_RELEASE/.next"
 chown -R \$APP_NAME:\$APP_NAME "\$NEW_RELEASE"
 
-echo "→ Lien symbolique shared/.env → \$NEW_RELEASE/.env"
+echo "→ Symlink shared/.env → \$NEW_RELEASE/.env"
 ln -sfn "\$APP_DIR/shared/.env" "\$NEW_RELEASE/.env"
 
-# Limite la RAM Node pour éviter l'OOM sur petites VM
+# Symlinks des dossiers persistants (uploads, etc.)
+if [ -n "\$PERSISTENT_DIRS_RAW" ]; then
+  echo "→ Symlinks des dossiers persistants depuis shared/..."
+  while IFS= read -r D; do
+    [ -z "\$D" ] && continue
+    SHARED_PATH="\$APP_DIR/shared/\$D"
+    REL_PATH="\$NEW_RELEASE/\$D"
+    # Créer le dossier shared si absent (1ère fois)
+    if [ ! -d "\$SHARED_PATH" ]; then
+      mkdir -p "\$SHARED_PATH"
+      chown -R \$APP_NAME:\$APP_NAME "\$SHARED_PATH"
+    fi
+    # Si la release contient déjà ce dossier (ex: public/uploads/ avec contenu défaut),
+    # le déplacer dans shared/ uniquement la première fois
+    if [ -d "\$REL_PATH" ] && [ ! -L "\$REL_PATH" ]; then
+      if [ -z "\$(ls -A "\$SHARED_PATH" 2>/dev/null)" ]; then
+        echo "    → Migration initiale : \$REL_PATH → shared/"
+        cp -a "\$REL_PATH"/. "\$SHARED_PATH"/ 2>/dev/null || true
+        chown -R \$APP_NAME:\$APP_NAME "\$SHARED_PATH"
+      fi
+      rm -rf "\$REL_PATH"
+    fi
+    mkdir -p "\$(dirname "\$REL_PATH")"
+    ln -sfn "\$SHARED_PATH" "\$REL_PATH"
+    echo "    \$D → shared/\$D"
+  done <<< "\$PERSISTENT_DIRS_RAW"
+fi
+
+# Limite RAM Node (évite OOM sur petites VM)
 NPM_ENV="NODE_OPTIONS=--max-old-space-size=1024"
 
 echo "→ Installation des dépendances (devDependencies incluses pour le build)..."
 if [ -f "\$NEW_RELEASE/package-lock.json" ]; then
   if ! su -s /bin/bash \$APP_NAME -c "cd \$NEW_RELEASE && \$NPM_ENV npm ci --include=dev --no-audit --no-fund"; then
-    echo ""
     echo "  ⚠ npm ci échoué — fallback sur npm install"
-    echo "     Cause probable : lock file généré sur autre OS/arch (deps optionnelles manquantes)"
-    echo "     Fix long-terme côté dev : rm -rf node_modules package-lock.json && npm install"
-    echo ""
-    su -s /bin/bash \$APP_NAME -c "cd \$NEW_RELEASE && \$NPM_ENV npm install --include=dev --no-audit --no-fund"
+    echo "     (lock file probablement désynchronisé entre OS/arch dev et serveur)"
+    su -s /bin/bash \$APP_NAME -c "cd \$NEW_RELEASE && \$NPM_ENV npm install --include=dev --no-audit --no-fund" \\
+      || abort "npm install échoué"
   fi
 else
   echo "  ⚠ package-lock.json absent — npm install (moins reproductible)"
-  su -s /bin/bash \$APP_NAME -c "cd \$NEW_RELEASE && \$NPM_ENV npm install --include=dev --no-audit --no-fund"
+  su -s /bin/bash \$APP_NAME -c "cd \$NEW_RELEASE && \$NPM_ENV npm install --include=dev --no-audit --no-fund" \\
+    || abort "npm install échoué"
 fi
 
 if [ -n "\$BUILD_CMD" ]; then
   echo "→ Build : \$BUILD_CMD"
-  if ! su -s /bin/bash \$APP_NAME -c "cd \$NEW_RELEASE && set -a && . \$APP_DIR/shared/.env && set +a && \$NPM_ENV \$BUILD_CMD"; then
-    echo "✗ Build échoué — swap annulé (release ratée : \$NEW_RELEASE)"
-    exit 1
-  fi
+  su -s /bin/bash \$APP_NAME -c "cd \$NEW_RELEASE && set -a && . \$APP_DIR/shared/.env && set +a && \$NPM_ENV \$BUILD_CMD" \\
+    || abort "Build échoué"
 fi
 
 if [ -n "\$MIGRATION_CMD" ]; then
   echo "→ Migrations DB : \$MIGRATION_CMD"
-  if ! su -s /bin/bash \$APP_NAME -c "cd \$NEW_RELEASE && set -a && . \$APP_DIR/shared/.env && set +a && \$NPM_ENV \$MIGRATION_CMD"; then
-    echo "✗ Migration échouée — swap annulé (release ratée : \$NEW_RELEASE)"
-    exit 1
-  fi
+  su -s /bin/bash \$APP_NAME -c "cd \$NEW_RELEASE && set -a && . \$APP_DIR/shared/.env && set +a && \$NPM_ENV \$MIGRATION_CMD" \\
+    || abort "Migration échouée"
 fi
 
 echo "→ Suppression des devDependencies..."
-su -s /bin/bash \$APP_NAME -c "cd \$NEW_RELEASE && \$NPM_ENV npm prune --omit=dev"
+su -s /bin/bash \$APP_NAME -c "cd \$NEW_RELEASE && \$NPM_ENV npm prune --omit=dev" || abort "npm prune échoué"
 
-# Nettoyage spécifique au framework : sources TS inutiles à l'exécution
+if [ -n "\$KEEP_DEV_DEPS" ]; then
+  echo "→ Réinstallation des devDeps à garder en prod : \$KEEP_DEV_DEPS"
+  su -s /bin/bash \$APP_NAME -c "cd \$NEW_RELEASE && \$NPM_ENV npm install --no-save --no-audit --no-fund \$KEEP_DEV_DEPS" \\
+    || abort "Réinstallation des devDeps échouée"
+fi
+
+# Nettoyage framework-spécifique (sources inutiles au runtime)
 case "\$FRAMEWORK" in
   nestjs)
-    # dist/ suffit pour le runtime
-    rm -rf "\$NEW_RELEASE/src" "\$NEW_RELEASE/test" "\$NEW_RELEASE/tsconfig"*.json "\$NEW_RELEASE/nest-cli.json" 2>/dev/null || true
-    ;;
-  nextjs)
-    # .next/ + public/ + next.config + node_modules prod suffisent
-    # Garder app/ ou pages/ pour les API routes runtime ? Next.js 13+ n'en a pas besoin.
-    # On laisse pour éviter les surprises.
-    :
+    # On garde src/ si l'entry est dist/src/main.js (TS source maps),
+    # sinon on peut le retirer
+    if [ "\$ENTRY" = "dist/main.js" ]; then
+      rm -rf "\$NEW_RELEASE/src" "\$NEW_RELEASE/test" "\$NEW_RELEASE/tsconfig"*.json "\$NEW_RELEASE/nest-cli.json" 2>/dev/null || true
+    fi
     ;;
 esac
+
+# ─── Auto-détection de l'entry point (NestJS / Express) ───
+if [ "\$FRAMEWORK" != "nextjs" ]; then
+  if [ ! -f "\$NEW_RELEASE/\$ENTRY" ]; then
+    echo "  ⚠ Entry point '\$ENTRY' introuvable — recherche d'un fallback..."
+    FOUND=""
+    for C in dist/main.js dist/src/main.js dist/index.js dist/app.js src/main.js src/server.js src/app.js src/index.js server.js app.js index.js; do
+      if [ -f "\$NEW_RELEASE/\$C" ]; then
+        FOUND="\$C"
+        break
+      fi
+    done
+    if [ -z "\$FOUND" ]; then
+      abort "Aucun entry point trouvé dans : dist/main.js, dist/src/main.js, src/server.js, ..."
+    fi
+    echo "  ✓ Fallback trouvé : \$FOUND"
+    ENTRY="\$FOUND"
+    # Mise à jour systemd avec le bon chemin
+    NEW_EXEC="/usr/bin/node \$CURRENT_LINK/\$ENTRY"
+    sed -i "s|^ExecStart=.*|ExecStart=\$NEW_EXEC|" "/etc/systemd/system/\$APP_NAME.service"
+    systemctl daemon-reload
+    echo "  → systemd ExecStart mis à jour : \$NEW_EXEC"
+  fi
+fi
 
 echo "→ Bascule du symlink current"
 ln -sfn "\$NEW_RELEASE" "\$CURRENT_LINK"
 chown -h \$APP_NAME:\$APP_NAME "\$CURRENT_LINK"
 
-echo "→ Reload PM2 (zero-downtime)..."
-if systemctl is-active --quiet \$APP_NAME; then
-  su -s /bin/bash \$APP_NAME -c "pm2 reload \$APP_NAME" || systemctl restart \$APP_NAME
-else
-  systemctl start \$APP_NAME
+echo "→ Restart systemd..."
+systemctl restart "\$APP_NAME"
+
+# ─── Health check + rollback automatique ──────────────────
+echo "→ Health check (10s)..."
+sleep 5
+HEALTHY=true
+for i in 1 2 3; do
+  if ! systemctl is-active --quiet "\$APP_NAME"; then
+    HEALTHY=false
+    break
+  fi
+  sleep 2
+done
+
+if ! \$HEALTHY; then
+  echo ""
+  echo "✗ Service inactif après restart — ROLLBACK automatique"
+  if [ -n "\$PREV_RELEASE" ] && [ -d "\$PREV_RELEASE" ]; then
+    ln -sfn "\$PREV_RELEASE" "\$CURRENT_LINK"
+    chown -h \$APP_NAME:\$APP_NAME "\$CURRENT_LINK"
+    systemctl restart "\$APP_NAME"
+    echo "  → Rollback vers \$(basename "\$PREV_RELEASE")"
+    sleep 3
+    systemctl status "\$APP_NAME" --no-pager -l | head -20
+  else
+    echo "  ⚠ Aucune release précédente pour rollback"
+    systemctl status "\$APP_NAME" --no-pager -l | head -20
+  fi
+  echo ""
+  echo "Logs erreur :"
+  journalctl -u "\$APP_NAME" -n 30 --no-pager
+  exit 1
 fi
 
-sleep 2
-systemctl status \$APP_NAME --no-pager -l | head -15
+systemctl status "\$APP_NAME" --no-pager -l | head -10
 
 echo "→ Purge des vieilles releases (garde 5)..."
 cd "\$RELEASES_DIR"
 ls -1t | tail -n +6 | xargs -r rm -rf
 
 echo ""
-echo "✓ Déploiement terminé — release \$TS active"
-echo "  Rollback : sudo ln -sfn \$RELEASES_DIR/<ancien> \$CURRENT_LINK && sudo systemctl reload \$APP_NAME"
+echo "✓ Déploiement réussi — release \$TS active"
+echo "  Logs : journalctl -u \$APP_NAME -f"
+echo "  Rollback manuel : sudo ln -sfn \$RELEASES_DIR/<ancien> \$CURRENT_LINK && sudo systemctl restart \$APP_NAME"
 DEPLOYEOF
 
 chmod +x "$DEPLOY_SCRIPT"
@@ -752,12 +846,16 @@ echo -e "${G}===============================================${N}"
 echo ""
 echo "  Dossier      : $APP_DIR"
 echo "  Port         : $APP_PORT"
-echo "  Entry point  : $ENTRY"
+[ -n "$ENTRY" ] && echo "  Entry point  : $ENTRY"
 echo "  Utilisateur  : $APP_NAME"
 echo "  Env          : $ENV_FILE"
-echo "  PM2 config   : $PM2_CONFIG"
+echo "  Superviseur  : systemd direct (pas de PM2)"
 echo "  Releases     : $RELEASES_DIR/"
 echo "  ORM          : $ORM"
+if [ ${#PERSISTENT_DIRS[@]} -gt 0 ]; then
+  echo "  Persistants  : ${PERSISTENT_DIRS[*]}"
+fi
+[ -n "$KEEP_DEV_DEPS" ] && echo "  DevDeps prod : $KEEP_DEV_DEPS"
 [ -n "$CADDY_DOMAIN" ] && echo "  URL publique : https://$CADDY_DOMAIN"
 [ "$ORM" != "none" ] && echo "  DB Manager   : sudo bash /opt/shared/scripts/$APP_NAME-db.sh"
 echo ""
@@ -786,13 +884,15 @@ if [ -n "$MIGRATION_CMD" ]; then
   echo "    $MIGRATION_CMD"
 fi
 echo "    npm prune --omit=dev   (retire devDependencies)"
-echo "    swap current → nouvelle release + reload PM2"
+[ -n "$KEEP_DEV_DEPS" ] && echo "    npm install --no-save $KEEP_DEV_DEPS   (devDeps à garder en prod)"
+echo "    swap current → nouvelle release"
+echo "    systemctl restart + health check (rollback auto si KO)"
 echo ""
 echo "Commandes utiles :"
-echo "  systemctl start|status|reload $APP_NAME"
-echo "  su -s /bin/bash $APP_NAME -c 'pm2 list'"
-echo "  tail -f $APP_DIR/logs/err.log"
-echo "  ls -lt $RELEASES_DIR/   # releases disponibles"
+echo "  systemctl start|stop|restart|status $APP_NAME"
+echo "  journalctl -u $APP_NAME -f       # logs systemd"
+echo "  tail -f $APP_DIR/logs/systemd.log"
+echo "  ls -lt $RELEASES_DIR/             # releases disponibles"
 if [ "$ORM" != "none" ]; then
   echo ""
   echo -e "${Y}DB Manager (menu interactif) :${N}"
