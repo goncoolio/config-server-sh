@@ -10,73 +10,215 @@
 # Appelé automatiquement au début des scripts 05* pour
 # éviter les collisions de noms/ports.
 # =========================================================
-set -euo pipefail
+# Note : on utilise set -uo pipefail (sans -e) pour qu'un fail
+# isolé sur un grep/ss n'arrête pas tout le diagnostic.
+set -uo pipefail
 
 G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; C='\033[0;36m'; B='\033[1m'; N='\033[0m'
 
 MODE="${1:-full}"
 
-# ─── Détection du framework d'une app dans /opt ───────────
+# =========================================================
+# Indexation des process en écoute (cache par PID → port,prog)
+# =========================================================
+# Évite d'appeler ss N fois. On parse une seule fois.
+# Format pipe-separé :  PID|PROG|PORT|PROTO|BIND
+declare -a SS_INDEX=()
+
+build_ss_index() {
+  command -v ss &>/dev/null || return
+  local line local_addr port bind proto proc_info prog pid
+  while IFS= read -r line; do
+    proto=$(echo "$line" | awk '{print $1}')
+    [ "$proto" = "Netid" ] && continue   # header
+    local_addr=$(echo "$line" | awk '{print $5}')
+    port="${local_addr##*:}"
+    bind="${local_addr%:*}"
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+
+    proc_info=$(echo "$line" | grep -oE 'users:\(\(.*' || true)
+    if [ -n "$proc_info" ]; then
+      prog=$(echo "$proc_info" | sed -nE 's/^users:\(\(\"([^\"]+)\".*/\1/p')
+      pid=$(echo "$proc_info" | sed -nE 's/.*pid=([0-9]+).*/\1/p')
+    else
+      prog=""
+      pid=""
+    fi
+    SS_INDEX+=("${pid:-?}|${prog:-?}|${port}|${proto}|${bind}")
+  done < <(ss -tlnpH 2>/dev/null)
+}
+
+# Trouve le service systemd qui possède un PID donné
+pid_to_service() {
+  local pid="$1"
+  [ -z "$pid" ] || [ "$pid" = "?" ] && return
+  # systemctl status accepte un PID et affiche la première ligne avec le service
+  local svc
+  svc=$(systemctl status "$pid" 2>/dev/null | head -1 | grep -oE '[a-zA-Z0-9_-]+\.service' | head -1 | sed 's/\.service$//')
+  echo "$svc"
+}
+
+# Trouve le port d'écoute d'un PID donné via le cache
+pid_to_port() {
+  local pid="$1"
+  [ -z "$pid" ] || [ "$pid" = "?" ] && return
+  for entry in "${SS_INDEX[@]}"; do
+    if [ "${entry%%|*}" = "$pid" ]; then
+      echo "$entry" | cut -d'|' -f3
+      return
+    fi
+  done
+}
+
+# =========================================================
+# DÉTECTION du framework et du port d'une app dans /opt
+# =========================================================
 detect_framework() {
   local dir="$1"
-  local current="$dir/current"
-  [ ! -e "$current" ] && { echo "?"; return; }
-  if [ -f "$current/artisan" ]; then echo "laravel"
-  elif [ -f "$current/next.config.js" ] || [ -f "$current/next.config.mjs" ]; then echo "nextjs"
-  elif [ -f "$current/nest-cli.json" ] || { [ -f "$current/package.json" ] && grep -q '"@nestjs/core"' "$current/package.json" 2>/dev/null; }; then echo "nestjs"
-  elif [ -f "$current/package.json" ]; then echo "node"
-  elif [ -f "$current/index.html" ]; then echo "static"
+  # Essaye d'abord current/, sinon le dossier directement (legacy)
+  local roots=("$dir/current" "$dir/src" "$dir")
+  for root in "${roots[@]}"; do
+    [ ! -e "$root" ] && continue
+    if [ -f "$root/artisan" ]; then echo "laravel"; return; fi
+    if [ -f "$root/next.config.js" ] || [ -f "$root/next.config.mjs" ] || [ -f "$root/next.config.ts" ]; then echo "nextjs"; return; fi
+    if [ -f "$root/nest-cli.json" ]; then echo "nestjs"; return; fi
+    if [ -f "$root/package.json" ] && grep -q '"@nestjs/core"' "$root/package.json" 2>/dev/null; then echo "nestjs"; return; fi
+    if [ -f "$root/package.json" ]; then
+      # Détection Express via dépendance
+      if grep -qE '"express"\s*:' "$root/package.json" 2>/dev/null; then echo "express"; return; fi
+      echo "node"; return
+    fi
+    if [ -f "$root/index.html" ]; then echo "static"; return; fi
+    # Rust : binaire exécutable au niveau racine du dossier
+    local bin
+    bin=$(find "$root" -maxdepth 1 -type f -executable 2>/dev/null | grep -v '\.sh$' | head -1)
+    if [ -n "$bin" ]; then echo "rust"; return; fi
+  done
+  echo "?"
+}
+
+# Cherche le PORT dans plusieurs endroits possibles
+get_port() {
+  local dir="$1"
+  local app
+  app=$(basename "$dir")
+  local port=""
+
+  # 1. shared/.env (architecture nouvelle)
+  for envf in "$dir/shared/.env" "$dir/.env" "$dir/src/.env" "$dir/current/.env"; do
+    if [ -f "$envf" ]; then
+      port=$(grep -E '^PORT=' "$envf" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' "')
+      [ -n "$port" ] && { echo "$port"; return; }
+    fi
+  done
+
+  # 2. Service systemd : Environment=PORT=
+  if systemctl cat "$app.service" >/dev/null 2>&1; then
+    port=$(systemctl show "$app" -p Environment --value 2>/dev/null | tr ' ' '\n' | grep -E '^PORT=' | head -1 | cut -d= -f2)
+    [ -n "$port" ] && { echo "$port"; return; }
+
+    # Lire EnvironmentFile s'il y en a un
+    local env_file
+    env_file=$(systemctl show "$app" -p EnvironmentFiles --value 2>/dev/null | awk '{print $1}' | head -1)
+    if [ -n "$env_file" ] && [ -f "$env_file" ]; then
+      port=$(grep -E '^PORT=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' "')
+      [ -n "$port" ] && { echo "$port"; return; }
+    fi
+  fi
+
+  # 3. Cross-référence : si le service tourne, regarde son PID et trouve le port d'écoute
+  if systemctl is-active --quiet "$app" 2>/dev/null; then
+    local pid
+    pid=$(systemctl show "$app" -p MainPID --value 2>/dev/null)
+    if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+      port=$(pid_to_port "$pid")
+      [ -n "$port" ] && { echo "$port"; return; }
+    fi
+  fi
+
+  # 4. ecosystem.config.js (PM2 legacy)
+  for pm2f in "$dir/ecosystem.config.js" "$dir/shared/ecosystem.config.js"; do
+    if [ -f "$pm2f" ]; then
+      port=$(grep -oE 'PORT[: =]+[0-9]+' "$pm2f" 2>/dev/null | head -1 | grep -oE '[0-9]+')
+      [ -n "$port" ] && { echo "$port"; return; }
+    fi
+  done
+
+  echo "-"
+}
+
+# Statut systemd robuste
+get_service_status() {
+  local app="$1"
+  if systemctl cat "$app.service" >/dev/null 2>&1; then
+    if systemctl is-active --quiet "$app" 2>/dev/null; then
+      echo "active"
+    elif systemctl is-failed --quiet "$app" 2>/dev/null; then
+      echo "failed"
+    else
+      echo "inactive"
+    fi
   else
-    # Rust : binaire exécutable au niveau racine
-    local bin=$(find "$current" -maxdepth 1 -type f -executable 2>/dev/null | head -1)
-    [ -n "$bin" ] && echo "rust" || echo "?"
+    echo "—"
   fi
 }
 
-# ─── Extraire le port depuis .env ─────────────────────────
-get_port() {
-  local env_file="$1/shared/.env"
-  [ ! -f "$env_file" ] && { echo "-"; return; }
-  grep -E '^PORT=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2 || echo "-"
+# Helper : print avec couleur pour le statut
+color_status() {
+  case "$1" in
+    active)   echo -e "${G}active${N}" ;;
+    failed)   echo -e "${R}failed${N}" ;;
+    inactive) echo -e "${R}inactive${N}" ;;
+    *)        echo "$1" ;;
+  esac
 }
 
-# ─── 1. Apps dans /opt ────────────────────────────────────
+# =========================================================
+# 1. Apps dans /opt
+# =========================================================
 print_apps() {
-  if [ ! -d /opt ] || ! ls -d /opt/*/ 2>/dev/null | grep -qv '/opt/shared'; then
+  local has_apps=false
+  for d in /opt/*/; do
+    local n
+    n=$(basename "$d")
+    [ "$n" = "shared" ] && continue
+    has_apps=true
+    break
+  done
+
+  if ! $has_apps; then
     echo "  (aucune app déployée)"
     return
   fi
 
-  printf "  ${B}%-20s %-10s %-8s %-12s %s${N}\n" "NOM" "FRAMEWORK" "PORT" "SERVICE" "RELEASES"
-  printf "  %-20s %-10s %-8s %-12s %s\n" "---" "---------" "----" "-------" "--------"
+  printf "  ${B}%-22s %-10s %-7s %-10s %s${N}\n" "NOM" "FRAMEWORK" "PORT" "SERVICE" "RELEASES"
+  printf "  %-22s %-10s %-7s %-10s %s\n" "---" "---------" "----" "-------" "--------"
 
   for d in /opt/*/; do
-    local name=$(basename "$d")
+    local name fw port releases status status_colored
+    name=$(basename "$d")
     [ "$name" = "shared" ] && continue
 
-    local fw=$(detect_framework "$d")
-    local port=$(get_port "$d")
-    local releases=0
+    fw=$(detect_framework "$d")
+    port=$(get_port "$d")
+    releases=0
     [ -d "$d/releases" ] && releases=$(ls -1 "$d/releases" 2>/dev/null | wc -l | tr -d ' ')
+    status=$(get_service_status "$name")
+    status_colored=$(color_status "$status")
 
-    local svc_status="—"
-    if systemctl list-unit-files "$name.service" 2>/dev/null | grep -q "$name.service"; then
-      if systemctl is-active --quiet "$name" 2>/dev/null; then
-        svc_status="${G}active${N}"
-      else
-        svc_status="${R}inactive${N}"
-      fi
-    fi
-
-    printf "  %-20s %-10s %-8s " "$name" "$fw" "$port"
-    echo -ne "$svc_status"
-    # Padding manuel (echo -e compte les codes ANSI)
-    local pad=$((12 - ${#svc_status} ))
+    # printf ne gère pas les codes ANSI dans %-Xs → on padding manuellement
+    printf "  %-22s %-10s %-7s " "$name" "$fw" "$port"
+    echo -ne "$status_colored"
+    local visible_len=${#status}
+    local pad=$((10 - visible_len))
+    [ $pad -lt 1 ] && pad=1
     printf "%${pad}s %s\n" "" "$releases"
   done
 }
 
-# ─── 2. Sites Caddy ───────────────────────────────────────
+# =========================================================
+# 2. Sites Caddy
+# =========================================================
 print_caddy_sites() {
   local dir="/etc/caddy/sites-enabled"
   if [ ! -d "$dir" ] || [ -z "$(ls -A "$dir" 2>/dev/null)" ]; then
@@ -89,53 +231,66 @@ print_caddy_sites() {
 
   for f in "$dir"/*.caddy; do
     [ ! -f "$f" ] && continue
-    local domain=$(basename "$f" .caddy)
-    local target=""
+    local domain target
+    domain=$(basename "$f" .caddy)
+    target=""
     if grep -q "reverse_proxy" "$f"; then
-      target="reverse_proxy → $(grep 'reverse_proxy' "$f" | head -1 | awk '{print $2}')"
+      target="proxy → $(grep 'reverse_proxy' "$f" | head -1 | awk '{print $2}')"
     elif grep -q "php_fastcgi" "$f"; then
-      target="php_fastcgi ($(grep 'root \*' "$f" | head -1 | awk '{print $3}'))"
+      target="php → $(grep 'root \*' "$f" | head -1 | awk '{print $3}')"
     elif grep -q "file_server" "$f"; then
-      target="static ($(grep 'root \*' "$f" | head -1 | awk '{print $3}'))"
+      target="static → $(grep 'root \*' "$f" | head -1 | awk '{print $3}')"
     fi
     printf "  %-40s %s\n" "$domain" "$target"
   done
 }
 
-# ─── 3. Ports locaux occupés ──────────────────────────────
+# =========================================================
+# 3. Ports locaux occupés (avec mapping vers service systemd)
+# =========================================================
 print_ports() {
   if ! command -v ss &>/dev/null; then
     echo "  (ss non disponible)"
     return
   fi
+  if [ "$EUID" -ne 0 ]; then
+    echo "  (lance en sudo pour voir les processus)"
+  fi
 
-  printf "  ${B}%-8s %-8s %s${N}\n" "PORT" "PROTO" "PROCESSUS"
-  printf "  %-8s %-8s %s\n" "----" "-----" "---------"
+  printf "  ${B}%-7s %-6s %-7s %-15s %s${N}\n" "PORT" "PROTO" "PID" "PROCESSUS" "SERVICE SYSTEMD"
+  printf "  %-7s %-6s %-7s %-15s %s\n" "----" "-----" "---" "---------" "---------------"
 
-  ss -tlnp 2>/dev/null \
-    | awk 'NR>1 && $4 ~ /127\.0\.0\.1:|0\.0\.0\.0:|\*:|\[::\]:/ {
-        split($4, a, ":");
-        port = a[length(a)];
-        proc = "";
-        for (i=7; i<=NF; i++) proc = proc " " $i;
-        print port "\t" $1 "\t" proc
-      }' \
-    | sort -u -k1,1n \
-    | while IFS=$'\t' read -r port proto proc; do
-        printf "  %-8s %-8s %s\n" "$port" "$proto" "$proc"
-      done
+  # Affiche le contenu trié par port
+  local entry pid prog port proto bind svc display_pid
+  declare -A seen=()
+
+  # Tri par port numérique
+  printf '%s\n' "${SS_INDEX[@]}" | sort -t'|' -k3,3n | while IFS='|' read -r pid prog port proto bind; do
+    # Dédoublonnage par port (un port peut apparaître sur 0.0.0.0 et ::)
+    [ -n "${seen[$port]:-}" ] && continue
+    seen[$port]=1
+
+    svc=""
+    if [ -n "$pid" ] && [ "$pid" != "?" ]; then
+      svc=$(pid_to_service "$pid")
+    fi
+
+    display_pid="${pid:-?}"
+    printf "  %-7s %-6s %-7s %-15s %s\n" "$port" "$proto" "$display_pid" "${prog:-?}" "${svc:-—}"
+  done
 }
 
-# ─── 4. Services systemd liés à /opt ──────────────────────
+# =========================================================
+# 4. Services systemd liés à /opt
+# =========================================================
 print_services() {
-  local services=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null \
-    | awk '{print $1}' \
-    | while read svc; do
-        local name="${svc%.service}"
-        if [ -d "/opt/$name" ] || systemctl cat "$svc" 2>/dev/null | grep -q "/opt/"; then
-          echo "$svc"
-        fi
-      done)
+  local services=""
+  while IFS= read -r unit; do
+    local name="${unit%.service}"
+    if [ -d "/opt/$name" ] || systemctl cat "$unit" 2>/dev/null | grep -q "WorkingDirectory=/opt/"; then
+      services="$services $unit"
+    fi
+  done < <(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}')
 
   if [ -z "$services" ]; then
     echo "  (aucun service lié à /opt)"
@@ -146,22 +301,31 @@ print_services() {
   printf "  %-30s %-10s %s\n" "-------" "-----" "------"
 
   for svc in $services; do
-    local state="inactive"
-    local since=""
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then
-      state="${G}active${N}"
+    local app="${svc%.service}"
+    local state since state_colored visible_len pad
+    state=$(get_service_status "$app")
+    state_colored=$(color_status "$state")
+    since=""
+    if [ "$state" = "active" ]; then
       since=$(systemctl show "$svc" -p ActiveEnterTimestamp --value 2>/dev/null | cut -d' ' -f2-3)
-    else
-      state="${R}inactive${N}"
     fi
     printf "  %-30s " "$svc"
-    echo -ne "$state"
-    local pad=$((10 - ${#state} ))
+    echo -ne "$state_colored"
+    visible_len=${#state}
+    pad=$((10 - visible_len))
+    [ $pad -lt 1 ] && pad=1
     printf "%${pad}s %s\n" "" "$since"
   done
 }
 
-# ─── MODE --short (inclusion dans 05*) ────────────────────
+# =========================================================
+# Construction de l'index ss en avance
+# =========================================================
+build_ss_index
+
+# =========================================================
+# MODE --short (inclusion dans 05*)
+# =========================================================
 if [ "$MODE" = "--short" ]; then
   echo -e "${C}━━ Apps déjà déployées ━━${N}"
   print_apps
@@ -175,7 +339,9 @@ if [ "$MODE" = "--short" ]; then
   exit 0
 fi
 
-# ─── MODE complet ─────────────────────────────────────────
+# =========================================================
+# MODE complet
+# =========================================================
 echo ""
 echo -e "${C}═══════════════════════════════════════════════${N}"
 echo -e "${C}  HTIC-NETWORKS — État du serveur              ${N}"

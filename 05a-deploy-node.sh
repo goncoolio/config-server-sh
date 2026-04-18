@@ -36,7 +36,7 @@ echo "  3) Next.js  — démarrage via 'next start' (auto-détecté)"
 read -rp "Choix [1-3] : " FW_CHOICE
 
 case "$FW_CHOICE" in
-  1) FRAMEWORK="nestjs";  DEFAULT_ENTRY="dist/main.js" ;;
+  1) FRAMEWORK="nestjs";  DEFAULT_ENTRY="dist/src/main.js" ;;  # NestJS moderne (src/ préservé)
   2) FRAMEWORK="express"; DEFAULT_ENTRY="src/server.js" ;;
   3) FRAMEWORK="nextjs";  DEFAULT_ENTRY="" ;;  # Next.js : géré via next start
   *) err "Choix invalide" ;;
@@ -60,12 +60,22 @@ read -rp "Port d'écoute local (ex: 3002) : " APP_PORT
 if [ "$FRAMEWORK" = "nextjs" ]; then
   ENTRY=""  # next start gère tout
 else
+  # Auto-détection : si une release existe déjà, propose l'entry réellement présent
+  if [ -d "$APP_DIR/current" ]; then
+    for CANDIDATE in dist/src/main.js dist/main.js dist/index.js src/main.js src/server.js src/app.js src/index.js server.js app.js index.js; do
+      if [ -f "$APP_DIR/current/$CANDIDATE" ]; then
+        DEFAULT_ENTRY="$CANDIDATE"
+        break
+      fi
+    done
+  fi
+
   echo ""
   echo "Entry point (chemin relatif à current/) — vérifié après le build."
   case "$FRAMEWORK" in
     nestjs)
-      echo "  Possibilités courantes : dist/main.js, dist/src/main.js"
-      echo "  (selon ta structure tsconfig — auto-détection de fallback à l'exécution)"
+      echo "  Possibilités courantes : dist/src/main.js (NestJS moderne), dist/main.js"
+      echo "  (auto-détection si une release existe ; fallback à l'exécution)"
       ;;
     express)
       echo "  Possibilités courantes : src/server.js, src/app.js, src/index.js, app.js, index.js"
