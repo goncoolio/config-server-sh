@@ -191,20 +191,73 @@ if [ ${#PERSISTENT_DIRS[@]} -gt 0 ]; then
 fi
 
 # ─── 5. Fichier .env (shared, persiste entre releases) ────
-inf "Génération de $ENV_FILE..."
-{
-  echo "# Environnement $APP_NAME — $(date)"
-  echo "NODE_ENV=production"
-  echo "PORT=$APP_PORT"
-  echo "HOST=127.0.0.1"
-  [ -n "$DB_URL" ] && echo "DATABASE_URL=$DB_URL"
+# Comportement intelligent :
+#   - Première install (.env absent)            → génère
+#   - Update sans nouvelles vars                 → conserve l'existant + met à jour PORT seulement
+#   - Update avec DB_URL ou ENV_EXTRAS fournis  → backup + merge (les nouvelles écrasent, les autres restent)
+mkdir -p "$(dirname "$ENV_FILE")"
+
+NEW_VARS_PROVIDED=false
+[ -n "$DB_URL" ] && NEW_VARS_PROVIDED=true
+[ ${#ENV_EXTRAS[@]} -gt 0 ] && NEW_VARS_PROVIDED=true
+
+if [ ! -f "$ENV_FILE" ]; then
+  # Première install : générer
+  inf "Génération initiale de $ENV_FILE..."
+  {
+    echo "# Environnement $APP_NAME — $(date)"
+    echo "NODE_ENV=production"
+    echo "PORT=$APP_PORT"
+    echo "HOST=127.0.0.1"
+    [ -n "$DB_URL" ] && echo "DATABASE_URL=$DB_URL"
+    for VAR in "${ENV_EXTRAS[@]}"; do
+      echo "$VAR"
+    done
+  } > "$ENV_FILE"
+  ok ".env créé"
+else
+  # Update : merge prudent
+  inf "$ENV_FILE existe — merge intelligent..."
+  cp -p "$ENV_FILE" "${ENV_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
+
+  # Construire la nouvelle valeur clé par clé en gardant les anciennes
+  TMP_ENV=$(mktemp)
+  cp "$ENV_FILE" "$TMP_ENV"
+
+  # Helper : update_or_add KEY=VALUE dans $TMP_ENV
+  update_var() {
+    local key="${1%%=*}"
+    local val="${1#*=}"
+    if grep -q "^${key}=" "$TMP_ENV" 2>/dev/null; then
+      # Existe déjà → remplacer (sed préserve l'ordre)
+      sed -i "s|^${key}=.*|${key}=${val}|" "$TMP_ENV"
+    else
+      echo "${key}=${val}" >> "$TMP_ENV"
+    fi
+  }
+
+  # Toujours rafraîchir PORT, NODE_ENV, HOST (valeurs structurelles)
+  update_var "NODE_ENV=production"
+  update_var "PORT=$APP_PORT"
+  update_var "HOST=127.0.0.1"
+
+  # DATABASE_URL et ENV_EXTRAS uniquement si fournis
+  [ -n "$DB_URL" ] && update_var "DATABASE_URL=$DB_URL"
   for VAR in "${ENV_EXTRAS[@]}"; do
-    echo "$VAR"
+    update_var "$VAR"
   done
-} > "$ENV_FILE"
+
+  mv "$TMP_ENV" "$ENV_FILE"
+
+  if $NEW_VARS_PROVIDED; then
+    ok ".env mis à jour (backup : ${ENV_FILE}.bak.*)"
+  else
+    ok ".env conservé (PORT/NODE_ENV/HOST rafraîchis, autres vars intactes)"
+  fi
+fi
+
 chown root:"$APP_NAME" "$ENV_FILE"
 chmod 640 "$ENV_FILE"
-ok ".env créé (chmod 640)"
 
 # ─── 6. Service systemd direct (sans PM2) ─────────────────
 # systemd est l'unique superviseur — PM2 supprimé pour éviter
@@ -532,16 +585,28 @@ run_as_app() {
 # Retour stdout : "__ALL__" pour tous, ou chemin complet, ou vide si annulé
 pick_file() {
   local dir="\$1"
-  local pattern="\$2"
+  local pattern="\$2"   # peut être "*.js" ou "*.js,*.ts" (multi-patterns séparés par virgule)
   local files=()
   if [ ! -d "\$dir" ]; then
     echo "" >&2
     echo -e "\${R}Dossier introuvable : \$dir\${N}" >&2
     return 1
   fi
+  # Construit l'expression find pour multi-patterns
+  local find_args=()
+  IFS=',' read -ra PATTERNS <<< "\$pattern"
+  local first=true
+  for p in "\${PATTERNS[@]}"; do
+    if \$first; then
+      find_args+=(-name "\$p")
+      first=false
+    else
+      find_args+=(-o -name "\$p")
+    fi
+  done
   while IFS= read -r f; do
     files+=("\$f")
-  done < <(find "\$dir" -maxdepth 2 -type f \\( -name "\$pattern" \\) 2>/dev/null | sort)
+  done < <(find "\$dir" -maxdepth 2 -type f \\( "\${find_args[@]}" \\) 2>/dev/null | sort)
 
   if [ \${#files[@]} -eq 0 ]; then
     echo "" >&2
@@ -712,17 +777,21 @@ exec_choice() {
     typeorm-5)
       # Cherche dans plusieurs emplacements typiques
       F=""
+      SEEDS_DIR=""
       for d in dist/seeds dist/database/seeds dist/db/seeds; do
         if [ -d "\$CURRENT/\$d" ]; then
-          F=\$(pick_file "\$CURRENT/\$d" "*.js")
+          SEEDS_DIR="\$CURRENT/\$d"
+          F=\$(pick_file "\$SEEDS_DIR" "*.js")
           break
         fi
       done
       [ -z "\$F" ] && { echo "Aucun dossier seeds trouvé (essaye dist/seeds/, dist/database/seeds/)"; return; }
       if [ "\$F" = "__ALL__" ]; then
-        for s in "\$CURRENT"/dist/seeds/*.js "\$CURRENT"/dist/database/seeds/*.js 2>/dev/null; do
+        shopt -s nullglob
+        for s in "\$SEEDS_DIR"/*.js; do
           [ -f "\$s" ] && run_as_app "node '\$s'"
         done
+        shopt -u nullglob
       else
         run_as_app "node '\$F'"
       fi
@@ -760,19 +829,23 @@ exec_choice() {
     drizzle-4) run_as_app "npx drizzle-kit pull" ;;
     drizzle-5)
       F=""
+      SEEDS_DIR=""
       for d in src/seeds db/seeds database/seeds dist/seeds; do
         if [ -d "\$CURRENT/\$d" ]; then
-          F=\$(pick_file "\$CURRENT/\$d" "*.{js,ts}")
+          SEEDS_DIR="\$CURRENT/\$d"
+          F=\$(pick_file "\$SEEDS_DIR" "*.js,*.ts")
           break
         fi
       done
-      [ -z "\$F" ] && return
+      [ -z "\$F" ] && { echo "Aucun dossier seeds trouvé"; return; }
       if [ "\$F" = "__ALL__" ]; then
-        for s in "\$CURRENT"/src/seeds/* "\$CURRENT"/db/seeds/* "\$CURRENT"/database/seeds/* "\$CURRENT"/dist/seeds/* 2>/dev/null; do
-          [ -f "\$s" ] && run_as_app "npx tsx '\$s' || node '\$s'"
+        shopt -s nullglob
+        for s in "\$SEEDS_DIR"/*.js "\$SEEDS_DIR"/*.ts; do
+          [ -f "\$s" ] && run_as_app "(npx tsx '\$s' 2>/dev/null || node '\$s')"
         done
+        shopt -u nullglob
       else
-        run_as_app "npx tsx '\$F' || node '\$F'"
+        run_as_app "(npx tsx '\$F' 2>/dev/null || node '\$F')"
       fi
       ;;
 
@@ -839,6 +912,23 @@ EOF
 fi
 
 # ─── Résumé ───────────────────────────────────────────────
+echo ""
+
+# ─── Health check : si en mode update et release existe, redémarrer + tester ─
+if $IS_UPDATE && [ -L "$CURRENT_LINK" ] && [ -d "$(readlink -f "$CURRENT_LINK")" ]; then
+  inf "Mode update : redémarrage du service avec la nouvelle config..."
+  systemctl restart "$APP_NAME"
+  sleep 3
+  if systemctl is-active --quiet "$APP_NAME"; then
+    ok "Service $APP_NAME actif après redémarrage"
+  else
+    warn "Service $APP_NAME inactif après redémarrage — vérifie les logs :"
+    echo "    journalctl -u $APP_NAME -n 50 --no-pager"
+    echo ""
+    journalctl -u "$APP_NAME" -n 20 --no-pager
+  fi
+fi
+
 echo ""
 echo -e "${G}===============================================${N}"
 echo -e "${G}  $APP_NAME ($FRAMEWORK) configuré             ${N}"
