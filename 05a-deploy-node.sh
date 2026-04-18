@@ -460,16 +460,20 @@ if [ -n "\$KEEP_DEV_DEPS" ]; then
     || abort "Réinstallation des devDeps échouée"
 fi
 
-# Nettoyage framework-spécifique (sources inutiles au runtime)
-case "\$FRAMEWORK" in
-  nestjs)
-    # On garde src/ si l'entry est dist/src/main.js (TS source maps),
-    # sinon on peut le retirer
-    if [ "\$ENTRY" = "dist/main.js" ]; then
+# Nettoyage framework-spécifique : DÉSACTIVÉ par défaut
+# Raisons de garder src/ + tsconfig + test/ :
+#   - Les seeds Prisma utilisant ts-node importent depuis ../src/...
+#   - Source maps debug
+#   - Re-build incrémental possible
+#   - Coût disque négligeable (quelques MB)
+# Pour activer un cleanup agressif, exporte AGGRESSIVE_CLEANUP=1 avant d'appeler ce script.
+if [ "\${AGGRESSIVE_CLEANUP:-0}" = "1" ]; then
+  case "\$FRAMEWORK" in
+    nestjs)
       rm -rf "\$NEW_RELEASE/src" "\$NEW_RELEASE/test" "\$NEW_RELEASE/tsconfig"*.json "\$NEW_RELEASE/nest-cli.json" 2>/dev/null || true
-    fi
-    ;;
-esac
+      ;;
+  esac
+fi
 
 # ─── Auto-détection de l'entry point (NestJS / Express) ───
 if [ "\$FRAMEWORK" != "nextjs" ]; then
