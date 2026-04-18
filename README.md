@@ -26,14 +26,57 @@ ou de ports avant de saisir tes valeurs.
 
 Choisis le script selon le framework :
 
-| Script | Framework | Entry point / Serveur |
+| Script | Framework | Entry / Serveur |
 |--------|-----------|-----------------------|
-| `05a-deploy-node.sh` | NestJS | `dist/main.js` via PM2 |
-| `05a-deploy-node.sh` | Express | `src/server.js` (personnalisable) via PM2 |
-| `05a-deploy-node.sh` | Next.js (SSR) | `next start` via PM2 |
+| `05a-deploy-node.sh` | NestJS | `dist/main.js` ou `dist/src/main.js` via systemd direct (auto-fallback) |
+| `05a-deploy-node.sh` | Express | entry personnalisable (src/server.js, app.js, …) via systemd |
+| `05a-deploy-node.sh` | Next.js (SSR) | `next start` via systemd |
 | `05b-deploy-rust.sh` | Rust | binaire natif via systemd |
 | `05c-deploy-laravel.sh` | Laravel | PHP-FPM + Caddy `php_fastcgi` |
 | `05d-deploy-static.sh` | HTML/CSS, SPA, Next.js export | Caddy `file_server` |
+
+> **Pas de PM2.** Tous les services Node tournent en systemd direct
+> (`Type=simple`, `ExecStart=/usr/bin/node …`). Évite la double supervision
+> systemd+PM2 qui causait des erreurs `spawn EACCES`.
+
+### Auto-détection de l'entry point (NestJS / Express)
+
+Le build NestJS produit parfois `dist/main.js`, parfois `dist/src/main.js`
+(selon ta structure `tsconfig.json`). À chaque déploiement, le script vérifie
+que l'entry configuré existe ; sinon il cherche un fallback parmi :
+
+```
+dist/main.js, dist/src/main.js, dist/index.js, dist/app.js,
+src/main.js, src/server.js, src/app.js, src/index.js,
+server.js, app.js, index.js
+```
+
+Si un fallback est trouvé, le `ExecStart` du service systemd est mis à jour
+automatiquement et `daemon-reload` est appelé.
+
+### Dossiers persistants entre releases
+
+À l'installation des scripts `05a/05b/05c`, tu peux déclarer des dossiers à
+**préserver entre les déploiements** (uploads utilisateurs, fichiers attachés…).
+
+Ils sont stockés dans `/opt/<app>/shared/<dossier>/` et **symlinkés** dans
+chaque nouvelle release. La première fois, si le dossier existe dans la release
+avec du contenu (ex: `public/uploads/` venant du repo), son contenu est migré
+dans `shared/` automatiquement.
+
+| Framework | Dossiers gérés par défaut | Dossiers additionnels typiques |
+|-----------|-----------------------|---------------------|
+| Node | aucun | `uploads`, `public/uploads`, `attachments` |
+| Rust | aucun | `uploads`, `data`, `attachments` |
+| Laravel | `storage/`, `bootstrap/cache/` | `public/uploads`, `public/storage` |
+
+### DevDependencies à garder en production (Node)
+
+Certaines apps utilisent `ts-node` en production (ex: `prisma db seed` qui
+exécute `ts-node prisma/seed.ts`). Le script `05a` te demande la liste de
+devDependencies à **réinstaller après** `npm prune --omit=dev`.
+
+Exemple pour Prisma + ts-node : `ts-node typescript @types/node`
 
 ### Exemple : app NestJS
 
