@@ -3,6 +3,43 @@
 Scripts d'installation et de déploiement pour un serveur Ubuntu 24.04 mutualisé
 (plusieurs apps, Caddy HTTPS, PostgreSQL, Adminer).
 
+> 🇬🇧 **English version** : voir [README.en.md](README.en.md)
+
+## Pourquoi ce projet ?
+
+Industrialiser le déploiement de plusieurs applications sur un **seul VPS
+Ubuntu**, sans Docker/Kubernetes et sans dépendre d'un PaaS tiers payant.
+
+Concrètement, ce lot de scripts résout :
+
+1. **Setup serveur reproductible** — sécurisation, swap, Caddy, PostgreSQL en
+   quelques commandes, jamais à refaire manuellement
+2. **Déploiement standardisé par framework** — chaque app obtient son
+   utilisateur système, son `.env`, son service systemd, son bloc Caddy et son
+   propre script de déploiement, généré automatiquement
+3. **Mises à jour zero-downtime** — système `releases/<timestamp>/` + symlink
+   `current`, rollback en une commande
+4. **Isolation entre apps** — un user dédié par app, droits 750, sandbox systemd
+5. **Migrations DB intégrées au pipeline** — la commande de migration
+   (Prisma / Sequelize / TypeORM / Knex / Drizzle / artisan / sqlx) tourne
+   automatiquement avant chaque swap ; échec ⇒ swap annulé
+6. **Préservation des données utilisateurs** — les dossiers comme `uploads/`
+   sont symlinkés depuis `shared/`, jamais écrasés lors d'une mise à jour
+7. **Diagnostic rapide** — un script affiche l'état complet du serveur (apps,
+   ports, sites Caddy, services), un menu interactif gère les ops courantes
+   d'ORM (migrations, seeds, studio)
+8. **Caddy modulaire** — un fichier par site (`sites-enabled/*.caddy`),
+   ajout/modification d'un domaine sans toucher aux autres
+9. **Résilience** — health check post-déploiement avec rollback automatique si
+   le service ne redémarre pas, fallback automatique sur l'entry point si le
+   chemin de build varie (`dist/main.js` vs `dist/src/main.js`)
+10. **Optimisé pour petites VM** — swap automatique, limites mémoire Node
+    explicites, pas de PM2 superflu (systemd direct)
+
+En une phrase : **un PaaS minimaliste sur VPS**, opinionné pour la stack
+Node/Rust/Laravel/Static, conçu pour héberger plusieurs apps sur le même
+serveur sans complexité inutile.
+
 ## Ordre d'exécution (première installation)
 
 ```bash
@@ -83,17 +120,19 @@ Exemple pour Prisma + ts-node : `ts-node typescript @types/node`
 ```bash
 sudo bash 05a-deploy-node.sh
 # Framework : 1 (NestJS)
-# Nom : munipay-api
+# Nom : monapi
 # Port : 3002
+# Entry point : dist/src/main.js   (ou dist/main.js — auto-fallback)
 # Domaine Caddy : api.exemple.com
 ```
 
 Le script configure :
-- utilisateur système dédié `munipay-api`
-- `/opt/munipay-api/` avec `releases/`, `shared/.env`, `current` symlink
-- PM2 via systemd (reload zero-downtime)
+- utilisateur système dédié `monapi`
+- `/opt/monapi/` avec `releases/`, `shared/.env`, `current` symlink
+- service systemd direct (`Type=simple`, `node $ENTRY`)
 - Caddy reverse proxy (si domaine fourni)
-- Script de déploiement `/opt/shared/scripts/deploy-munipay-api.sh`
+- script de déploiement `/opt/shared/scripts/deploy-monapi.sh`
+- DB Manager `/opt/shared/scripts/monapi-db.sh` (si ORM choisi)
 
 ### Approche : build sur le serveur
 
@@ -129,17 +168,19 @@ sudo bash /opt/shared/scripts/deploy-munipay-api.sh /tmp/munipay-api-src
 ```
 
 Le script de déploiement exécute dans l'ordre :
-1. Copie le source dans `/opt/munipay-api/releases/<timestamp>/`
-2. Link symbolique vers `shared/.env`
+1. Copie le source dans `/opt/<app>/releases/<timestamp>/`
+2. Symlink `shared/.env` + dossiers persistants (`uploads/`, etc.)
 3. `npm ci --include=dev` (toutes les deps pour permettre le build)
 4. Commande de build (`npm run build`, etc.) si configurée
 5. **Migrations DB** (si configurées)
 6. `npm prune --omit=dev` (retire les devDependencies)
-7. Bascule `current` → nouvelle release (atomique)
-8. Reload PM2 (zero-downtime)
-9. Purge des vieilles releases (garde les 5 dernières)
+7. Réinstalle les devDeps marquées « à garder » (ts-node, etc.)
+8. Vérifie que l'entry point existe (auto-fallback NestJS)
+9. Bascule `current` → nouvelle release (atomique)
+10. `systemctl restart` + **health check** (rollback auto si KO)
+11. Purge des vieilles releases (garde les 5 dernières)
 
-> Si le build **ou** la migration échoue, le swap est **annulé** — l'ancienne
+> Si le build, la migration **ou** le démarrage du service échoue, l'ancienne
 > release reste active. La release ratée est conservée pour debug.
 
 ### Migrations DB
@@ -177,7 +218,7 @@ juste un chiffre.
 
 ```
 ════════════════════════════════════════════════
-  DB Manager — api-wii-saas (sequelize)
+  DB Manager — monapi (sequelize)
 ════════════════════════════════════════════════
 
   MIGRATIONS
@@ -231,11 +272,11 @@ confirmation explicite (taper `CONFIRMER`).
 
 ```bash
 # Liste des releases
-ls -lt /opt/munipay-api/releases/
+ls -lt /opt/<app>/releases/
 
 # Rollback vers une version précédente
-sudo ln -sfn /opt/munipay-api/releases/20260417_143022 /opt/munipay-api/current
-sudo systemctl reload munipay-api
+sudo ln -sfn /opt/<app>/releases/20260101_143022 /opt/<app>/current
+sudo systemctl restart <app>
 ```
 
 ## Caddy — gestion des sites
@@ -286,7 +327,7 @@ Deux types de mises à jour — ne les confonds pas :
 | Besoin | Script à utiliser | Effet |
 |--------|-------------------|-------|
 | **Nouveau code / binaire** (nouvelle version de l'app) | `sudo bash /opt/shared/scripts/deploy-<app>.sh <source>` | Crée `releases/<timestamp>/`, bascule `current`, reload service (zero-downtime) |
-| **Changer port, env vars, entry point, domaine Caddy** | `sudo bash 05a/b/c/d-deploy-*.sh` | Détecte l'app existante, régénère `.env` / PM2 / systemd / bloc Caddy — **ne touche pas au code déployé** |
+| **Changer port, env vars, entry point, domaine Caddy** | `sudo bash 05a/b/c/d-deploy-*.sh` | Détecte l'app existante, régénère `.env` / systemd / bloc Caddy — **ne touche pas au code déployé** |
 | **Ajouter ou modifier un domaine Caddy** (sans toucher à l'app) | `sudo bash 02b-add-caddy-site.sh [domaine]` | Écrit uniquement `sites-enabled/<domaine>.caddy`, reload Caddy |
 | **Rollback vers une release précédente** | `sudo ln -sfn /opt/<app>/releases/<ancien> /opt/<app>/current && sudo systemctl reload <app>` | Bascule atomique du symlink |
 | **Voir l'état du serveur** (apps, ports, sites) | `sudo bash 00-list-apps.sh` | Récap complet |
@@ -298,7 +339,7 @@ Tous les scripts `05a/b/c/d` sont **idempotents**. Si l'app existe déjà ils
 affichent `[AVERT] App <nom> existe déjà → mode MISE À JOUR de la config` et
 mettent à jour uniquement :
 - le fichier `.env` (dans `shared/`)
-- la config PM2 / systemd
+- la config systemd
 - le bloc Caddy (si domaine fourni)
 
 Les releases existantes et le symlink `current` ne sont pas touchés — seul le
@@ -309,19 +350,16 @@ prochain `deploy-<app>.sh` créera une nouvelle release avec du nouveau code.
 ```
 /opt/<app>/
 ├── releases/
-│   ├── 20260417_143022/        # release N-2
-│   ├── 20260417_150811/        # release N-1
-│   └── 20260417_161533/        # release actuelle
+│   ├── 20260101_143022/        # release N-2
+│   ├── 20260101_150811/        # release N-1
+│   └── 20260101_161533/        # release actuelle
 ├── shared/
 │   ├── .env                    # persiste entre releases
-│   ├── ecosystem.config.js     # config PM2 (Node)
+│   ├── uploads/                # dossiers utilisateurs (symlinkés)
 │   └── storage/                # Laravel
 ├── logs/
-│   ├── out.log
-│   ├── err.log
 │   └── systemd.log
-├── current → releases/20260417_161533
-└── .pm2/                       # PM2 home (Node)
+└── current → releases/20260101_161533
 ```
 
 ## Dépannage
@@ -330,7 +368,7 @@ prochain `deploy-<app>.sh` créera une nouvelle release avec du nouveau code.
 # Logs par app
 systemctl status <app>
 journalctl -u <app> -f
-tail -f /opt/<app>/logs/err.log
+tail -f /opt/<app>/logs/systemd-err.log
 
 # Logs Caddy par site
 tail -f /var/log/caddy/<domaine_avec_underscores>.log
